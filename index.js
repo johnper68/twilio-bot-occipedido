@@ -1,156 +1,120 @@
-require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const { MessagingResponse } = require('twilio').twiml;
+const bodyParser = require('body-parser');
+require('dotenv').config();
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-const APPSHEET_API_KEY = process.env.APPSHEET_API_KEY;
-const BASE_URL = process.env.APPSHEET_BASE_URL;
-const PRODUCTOS_URL = `${BASE_URL}/tables/productos/Action`;
-const PEDIDOS_URL = `${BASE_URL}/tables/pedido/Action`;
-const ENCABEZADO_URL = `${BASE_URL}/tables/enc_pedido/Action`;
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
-const sesiones = {};
+let pedido = [];
+let enProceso = false;
 
-const generarRespuesta = (mensaje) => {
-  const twiml = new MessagingResponse();
-  twiml.message(mensaje);
-  return twiml.toString();
-};
-
+// Ruta principal webhook
 app.post('/webhook', async (req, res) => {
-  const mensaje = req.body.Body?.trim().toLowerCase();
-  const numero = req.body.From?.split(':').pop();
-  const session = sesiones[numero] || { paso: 'inicio', pedido: [], datos: {} };
+    const incomingMsg = req.body.Body?.trim().toLowerCase();
+    const from = req.body.From;
 
-  const send = (msg) => res.type('text/xml').send(generarRespuesta(msg));
-  sesiones[numero] = session;
+    console.log(`Mensaje de ${from}: ${incomingMsg}`);
 
-  if (mensaje === 'pedido') {
-    session.paso = 'cliente';
-    return send('👤 Escribe tu *nombre completo*:');
-  }
+    let reply = '';
 
-  if (mensaje === 'fin') {
-    if (session.pedido.length === 0) return send('❌ No hay productos registrados.');
-    const total = session.pedido.reduce((sum, item) => sum + item.valor, 0);
-    const resumen = session.pedido.map((p, i) =>
-      `${i + 1}. *${p.nombreProducto}* x${p.cantidadProducto} = $${p.valor.toLocaleString('es-CO')}`
-    ).join('\n');
-    const encabezado = {
-      pedidoId: Math.random().toString(36).substring(2, 10),
-      cliente: session.datos.cliente,
-      direccion: session.datos.direccion,
-      celular: session.datos.celular,
-      fecha: new Date().toISOString().split('T')[0],
-      enc_total: total
-    };
-    try {
-      await axios.post(ENCABEZADO_URL, {
-        Action: 'Add',
-        Properties: { Locale: 'es-ES' },
-        Rows: [encabezado]
-      }, { headers: {
-        'ApplicationAccessKey': APPSHEET_API_KEY,
-        'Content-Type': 'application/json'
-      }});
-      for (const item of session.pedido) {
-        await axios.post(PEDIDOS_URL, {
-          Action: 'Add',
-          Properties: { Locale: 'es-ES' },
-          Rows: [{
-            pedidoId: encabezado.pedidoId,
-            fecha: encabezado.fecha,
-            nombreProducto: item.nombreProducto,
-            cantidadProducto: item.cantidadProducto,
-            valor_unit: item.valor_unit,
-            valor: item.valor,
-            status: 'Pendiente'
-          }]
-        }, { headers: {
-          'ApplicationAccessKey': APPSHEET_API_KEY,
-          'Content-Type': 'application/json'
-        }});
-      }
-      sesiones[numero] = { paso: 'inicio', pedido: [], datos: {} };
-      return send(`✅ Pedido enviado correctamente 🧾\n${resumen}\n💰 Total: $${total.toLocaleString('es-CO')}`);
-    } catch (error) {
-      console.error('❌ Error al guardar pedido:', error.message);
-      return send('❌ Error al guardar el pedido. Intenta más tarde.');
+    if (!incomingMsg) {
+        reply = 'Mensaje vacío. Intenta nuevamente.';
+    } else if (!enProceso && incomingMsg === 'hola') {
+        enProceso = true;
+        reply = await listarProductos();
+    } else if (enProceso && /^[1-9]\d*$/.test(incomingMsg)) {
+        const index = parseInt(incomingMsg) - 1;
+        const producto = await obtenerProducto(index);
+        if (producto) {
+            pedido.push(producto);
+            reply = `✅ Producto agregado: ${producto.Nombre}\n\nPuedes escribir otro número o escribe *fin* para terminar.`;
+        } else {
+            reply = '❌ Número inválido. Intenta nuevamente.';
+        }
+    } else if (enProceso && incomingMsg === 'fin') {
+        reply = generarResumenPedido();
+        enProceso = false;
+        pedido = [];
+    } else {
+        reply = '❓ Escribe "hola" para comenzar tu pedido.';
     }
-  }
 
-  switch (session.paso) {
-    case 'cliente':
-      session.datos.cliente = req.body.Body.trim();
-      session.paso = 'direccion';
-      return send('🏠 Escribe tu *dirección*');
-    case 'direccion':
-      session.datos.direccion = req.body.Body.trim();
-      session.paso = 'celular';
-      return send('📱 Escribe tu *celular* (10 dígitos):');
-    case 'celular':
-      const celular = req.body.Body.trim();
-      if (!/^\d{10}$/.test(celular)) return send('❌ Número inválido.');
-      session.datos.celular = celular;
-      session.paso = 'producto';
-      return send('🛒 Escribe una palabra del producto que deseas buscar:');
-    case 'producto':
-      try {
-        const busqueda = req.body.Body.trim().toLowerCase();
-        const resp = await axios.post(PRODUCTOS_URL, {
-          Action: 'Find',
-          Properties: { Locale: 'es-ES' },
-          Rows: []
-        }, { headers: {
-          'ApplicationAccessKey': APPSHEET_API_KEY,
-          'Content-Type': 'application/json'
-        }});
-        const productos = resp.data?.value || [];
-        const encontrados = productos.filter(p => p.nombreProducto?.toLowerCase().includes(busqueda)).slice(0, 5);
-        if (encontrados.length === 0) return send('❌ No se encontraron productos.');
-        session.resultados = encontrados;
-        session.paso = 'seleccion';
-        return send('🔍 Selecciona el número del producto:\n' +
-          encontrados.map((p, i) =>
-            `${i + 1}. ${p.nombreProducto} - $${parseFloat(p.valor).toLocaleString('es-CO')}`
-          ).join('\n'));
-      } catch (e) {
-        console.error('Error al buscar productos:', e.message);
-        return send('❌ Error al buscar productos.');
-      }
-    case 'seleccion':
-      const seleccion = parseInt(req.body.Body.trim());
-      const resultados = session.resultados || [];
-      if (isNaN(seleccion) || seleccion < 1 || seleccion > resultados.length) {
-        return send('❌ Selección inválida.');
-      }
-      session.productoSeleccionado = resultados[seleccion - 1];
-      session.paso = 'cantidad';
-      return send(`🧮 ¿Cuántas unidades de *${session.productoSeleccionado.nombreProducto}* deseas?`);
-    case 'cantidad':
-      const cantidad = parseFloat(req.body.Body.trim());
-      const producto = session.productoSeleccionado;
-      if (isNaN(cantidad) || cantidad <= 0) return send('❌ Cantidad inválida.');
-      const valorUnitario = parseFloat(producto.valor);
-      const subtotal = cantidad * valorUnitario;
-      session.pedido.push({
-        nombreProducto: producto.nombreProducto,
-        cantidadProducto: cantidad,
-        valor_unit: valorUnitario,
-        valor: subtotal
-      });
-      session.paso = 'producto';
-      return send(`✅ Producto agregado: ${producto.nombreProducto} x${cantidad} = $${subtotal.toLocaleString('es-CO')}\n🛒 Escribe otro producto o *FIN* para terminar.`);
-  }
-
-  return send('👋 Bienvenido a *Occiquímicos*.\nEscribe *PEDIDO* para comenzar o *FIN* para cerrar.');
+    res.set('Content-Type', 'text/xml');
+    res.send(`
+        <Response>
+            <Message>${reply}</Message>
+        </Response>
+    `);
 });
 
-const PORT = process.env.PORT || 3000;
+// Función para listar productos
+async function listarProductos() {
+    try {
+        const response = await axios.get(`${process.env.APPSHEET_BASE_URL}/tables/Productos/records`, {
+            headers: {
+                'ApplicationAccessKey': process.env.APPSHEET_API_KEY
+            }
+        });
+
+        const productos = response.data?.value || [];
+
+        if (productos.length === 0) {
+            return '⚠️ No hay productos disponibles.';
+        }
+
+        let lista = '📦 *Productos disponibles:*\n\n';
+        productos.slice(0, 10).forEach((p, i) => {
+            lista += `${i + 1}. ${p.Nombre} - $${p.Precio}\n`;
+        });
+        lista += '\n✏️ Escribe el número del producto para agregarlo.\nEscribe *fin* para terminar.';
+
+        return lista;
+    } catch (error) {
+        console.error('Error al obtener productos:', error.message);
+        return '❌ Error al consultar productos. Intenta más tarde.';
+    }
+}
+
+// Función para obtener producto por índice
+async function obtenerProducto(index) {
+    try {
+        const response = await axios.get(`${process.env.APPSHEET_BASE_URL}/tables/Productos/records`, {
+            headers: {
+                'ApplicationAccessKey': process.env.APPSHEET_API_KEY
+            }
+        });
+
+        const productos = response.data?.value || [];
+
+        return productos[index] || null;
+    } catch (error) {
+        console.error('Error al obtener producto:', error.message);
+        return null;
+    }
+}
+
+// Función para generar resumen del pedido
+function generarResumenPedido() {
+    if (pedido.length === 0) {
+        return '🛒 No agregaste ningún producto.';
+    }
+
+    let resumen = '🧾 *Resumen de tu pedido:*\n\n';
+    let total = 0;
+
+    pedido.forEach((item, i) => {
+        resumen += `${i + 1}. ${item.Nombre} - $${item.Precio}\n`;
+        total += Number(item.Precio);
+    });
+
+    resumen += `\n💰 Total: $${total.toFixed(2)}\n📦 Gracias por tu pedido.`;
+    return resumen;
+}
+
 app.listen(PORT, () => {
-  console.log(`✅ Bot de WhatsApp activo en puerto ${PORT}`);
+    console.log(`✅ Servidor escuchando en puerto ${PORT}`);
 });
