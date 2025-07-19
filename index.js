@@ -54,7 +54,7 @@ app.post('/webhook', async (req, res) => {
 // Función para listar productos
 async function listarProductos() {
     try {
-        const response = await axios.get(`${process.env.APPSHEET_BASE_URL}/tables/Productos/records`, {
+        const response = await axios.get(`${process.env.APPSHEET_BASE_URL}/tables/productos/records`, {
             headers: {
                 'ApplicationAccessKey': process.env.APPSHEET_API_KEY
             }
@@ -82,7 +82,7 @@ async function listarProductos() {
 // Función para obtener producto por índice
 async function obtenerProducto(index) {
     try {
-        const response = await axios.get(`${process.env.APPSHEET_BASE_URL}/tables/Productos/records`, {
+        const response = await axios.get(`${process.env.APPSHEET_BASE_URL}/tables/productos/records`, {
             headers: {
                 'ApplicationAccessKey': process.env.APPSHEET_API_KEY
             }
